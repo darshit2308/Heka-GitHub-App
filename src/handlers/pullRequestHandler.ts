@@ -74,8 +74,9 @@ export async function handlePullRequestEvent(
   //
   // This appears immediately in the PR's "Checks" panel, giving the contributor
   // real-time feedback that verification is running.
+  // Capture the check run id so we can update (not duplicate) it below.
   // ---------------------------------------------------------------------------
-  await context.octokit.checks.create({
+  const { data: checkRun } = await context.octokit.checks.create({
     ...repoInfo,
     name: CHECK_NAME,
     head_sha: sha,
@@ -97,15 +98,17 @@ export async function handlePullRequestEvent(
   }
 
   // ---------------------------------------------------------------------------
-  // Step 4: Complete the check run
+  // Step 4: Update the existing check run to completed
+  //
+  // Using checks.update (not a second checks.create) so the PR Checks panel
+  // shows a single entry that transitions from "in progress" → pass/fail.
   // ---------------------------------------------------------------------------
   if (verificationResult.isVerified) {
     app.log.info(`✓ Identity verified for @${username} — fingerprint: ${verificationResult.gpgFingerprint}`);
 
-    await context.octokit.checks.create({
+    await context.octokit.checks.update({
       ...repoInfo,
-      name: CHECK_NAME,
-      head_sha: sha,
+      check_run_id: checkRun.id,
       status: 'completed',
       conclusion: 'success',
       output: {
@@ -120,10 +123,9 @@ export async function handlePullRequestEvent(
   } else {
     app.log.warn(`✗ Verification not found for @${username}`);
 
-    await context.octokit.checks.create({
+    await context.octokit.checks.update({
       ...repoInfo,
-      name: CHECK_NAME,
-      head_sha: sha,
+      check_run_id: checkRun.id,
       status: 'completed',
       conclusion: 'failure',
       output: {

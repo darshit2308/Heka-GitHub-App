@@ -39,16 +39,20 @@ const reopenedPayload = { ...openedPayload, action: 'reopened' };
  *   1. POST /app/installations/:id/access_tokens  — obtain installation token
  *   2. GET  /repos/:owner/:repo/commits/:sha/check-runs  — idempotency list
  *
- * @param sha   - The head commit SHA from the payload.
- * @param runs  - Array of existing check runs to return (empty = first delivery).
+ * @param sha      - The head commit SHA from the payload.
+ * @param runs     - Array of existing check runs to return (empty = first delivery).
+ * @param checkId  - The id to return in the in_progress create response (default: 42).
  */
-function mockGitHubPreamble(sha: string, runs: object[] = []) {
+function mockGitHubPreamble(sha: string, runs: object[] = [], checkId = 42) {
   return nock('https://api.github.com')
     .post('/app/installations/2/access_tokens')
     .reply(200, { token: 'test', permissions: { checks: 'write' } })
     .get(`/repos/test-org/test-repo/commits/${sha}/check-runs`)
     .query({ check_name: 'Heka Identity Verification', filter: 'latest' })
-    .reply(200, { total_count: runs.length, check_runs: runs });
+    .reply(200, { total_count: runs.length, check_runs: runs })
+    // The handler calls checks.create for the in_progress run and reads .data.id
+    .post('/repos/test-org/test-repo/check-runs')
+    .reply(201, { id: checkId, name: 'Heka Identity Verification', status: 'in_progress' });
 }
 
 /**
@@ -99,21 +103,14 @@ describe('Heka Identity Verification Bot', () => {
     const sha = openedPayload.pull_request.head.sha;
 
     const githubMock = mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
-        expect(body.name).toBe('Heka Identity Verification');
-        expect(body.head_sha).toBe(sha);
-        expect(body.status).toBe('in_progress');
-        return true;
-      })
-      .reply(201)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+      .patch('/repos/test-org/test-repo/check-runs/42', (body: Record<string, unknown>) => {
         expect(body.status).toBe('completed');
         expect(body.conclusion).toBe('success');
-        expect(body.output.title).toContain('Verified');
-        expect(body.output.summary).toContain('A1B2C3D4');
+        expect((body.output as any).title).toContain('Verified');
+        expect((body.output as any).summary).toContain('A1B2C3D4');
         return true;
       })
-      .reply(201);
+      .reply(200);
 
     const hekaMock = mockHekaStatus('test-contributor', {
       isVerified: true,
@@ -136,18 +133,13 @@ describe('Heka Identity Verification Bot', () => {
     const sha = openedPayload.pull_request.head.sha;
 
     const githubMock = mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
-        expect(body.status).toBe('in_progress');
-        return true;
-      })
-      .reply(201)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+      .patch('/repos/test-org/test-repo/check-runs/42', (body: Record<string, unknown>) => {
         expect(body.status).toBe('completed');
         expect(body.conclusion).toBe('failure');
-        expect(body.output.title).toContain('Unverified');
+        expect((body.output as any).title).toContain('Unverified');
         return true;
       })
-      .reply(201);
+      .reply(200);
 
     const hekaMock = mockHekaStatus('test-contributor', {
       isVerified: false,
@@ -168,17 +160,12 @@ describe('Heka Identity Verification Bot', () => {
     const sha = openedPayload.pull_request.head.sha;
 
     const githubMock = mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
-        expect(body.status).toBe('in_progress');
-        return true;
-      })
-      .reply(201)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+      .patch('/repos/test-org/test-repo/check-runs/42', (body: Record<string, unknown>) => {
         expect(body.status).toBe('completed');
         expect(body.conclusion).toBe('failure');
         return true;
       })
-      .reply(201);
+      .reply(200);
 
     // Simulate a network-level failure from the identity service
     nock(HEKA_GPG_PATH).get('/status/test-contributor').replyWithError('ECONNREFUSED');
@@ -196,14 +183,8 @@ describe('Heka Identity Verification Bot', () => {
     const sha = synchronizePayload.pull_request.head.sha;
 
     const githubMock = mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
-        expect(body.head_sha).toBe(sha); // New SHA, not the opened event SHA
-        expect(body.status).toBe('in_progress');
-        return true;
-      })
-      .reply(201)
-      .post('/repos/test-org/test-repo/check-runs')
-      .reply(201);
+      .patch('/repos/test-org/test-repo/check-runs/42')
+      .reply(200);
 
     mockHekaStatus('test-contributor', {
       isVerified: false,
@@ -223,13 +204,8 @@ describe('Heka Identity Verification Bot', () => {
     const sha = reopenedPayload.pull_request.head.sha;
 
     const githubMock = mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
-        expect(body.status).toBe('in_progress');
-        return true;
-      })
-      .reply(201)
-      .post('/repos/test-org/test-repo/check-runs')
-      .reply(201);
+      .patch('/repos/test-org/test-repo/check-runs/42')
+      .reply(200);
 
     mockHekaStatus('test-contributor', {
       isVerified: false,
@@ -248,16 +224,26 @@ describe('Heka Identity Verification Bot', () => {
   test('skips processing when a non-queued check run already exists for the SHA', async () => {
     const sha = openedPayload.pull_request.head.sha;
 
-    // Return an existing in_progress run for this SHA — simulates a re-delivery
-    const githubMock = mockGitHubPreamble(sha, [
-      {
-        id: 1,
-        name: 'Heka Identity Verification',
-        head_sha: sha,
-        status: 'in_progress',
-        conclusion: null,
-      },
-    ]);
+    // Return an existing in_progress run for this SHA — simulates a re-delivery.
+    // Use a separate nock chain that does NOT register the POST /check-runs mock
+    // because the handler returns before ever calling checks.create.
+    const githubMock = nock('https://api.github.com')
+      .post('/app/installations/2/access_tokens')
+      .reply(200, { token: 'test', permissions: { checks: 'write' } })
+      .get(`/repos/test-org/test-repo/commits/${sha}/check-runs`)
+      .query({ check_name: 'Heka Identity Verification', filter: 'latest' })
+      .reply(200, {
+        total_count: 1,
+        check_runs: [
+          {
+            id: 1,
+            name: 'Heka Identity Verification',
+            head_sha: sha,
+            status: 'in_progress',
+            conclusion: null,
+          },
+        ],
+      });
 
     // If idempotency fails, the handler would call checks.create and hekaService.
     // Neither mock is registered, so nock would throw if they are called.
@@ -276,14 +262,12 @@ describe('Heka Identity Verification Bot', () => {
     const fingerprint = 'DEADBEEF12345678';
 
     mockGitHubPreamble(sha)
-      .post('/repos/test-org/test-repo/check-runs')
-      .reply(201) // in_progress
-      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+      .patch('/repos/test-org/test-repo/check-runs/42', (body: Record<string, unknown>) => {
         const output = body.output as { summary: string };
         expect(output.summary).toContain(fingerprint);
         return true;
       })
-      .reply(201);
+      .reply(200);
 
     mockHekaStatus('test-contributor', {
       isVerified: true,
