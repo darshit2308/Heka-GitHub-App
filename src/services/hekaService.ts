@@ -1,16 +1,34 @@
-import axios from 'axios'
-import { HEKA_URL } from '../config/env.ts'
-import type { VerificationResult } from '../types/verification.ts'
+import axios from 'axios';
+import { HEKA_GPG_PATH } from '../config/env.ts';
+import type { VerificationResult } from '../types/verification.ts';
 
-export async function verifyContributor(github_username: string): Promise<VerificationResult> {
-  // Now we connect with the Mock Heka Identity Server running on port 3000
-  // Another feature, got the tip to add from AI: Added 5s timeout so a dead Heka service fails fast
-  // instead of hanging the webhook for 30 seconds until GitHub times it out
-  const response = await axios.post(
-    `${HEKA_URL}/verify`,
-    { github_username },
-    { timeout: 5000 }
-  )
+/**
+ * Queries the Heka identity service to determine whether a contributor has
+ * already completed GPG ownership verification.
+ *
+ * During a PR event the GitHub App's job is *not* to initiate a new challenge
+ * — it is to check whether the PR author has already proved ownership of the
+ * GPG key registered on their GitHub profile.  If they have not, the App
+ * posts a failing check run with instructions directing them to the Heka web
+ * portal to complete the flow.
+ *
+ * The status endpoint always returns HTTP 200 with `isVerified: false` for
+ * contributors who have not yet verified, so this function never throws on a
+ * "not found" case — only on genuine network or server errors.
+ *
+ * @param githubUsername - GitHub login of the PR author.
+ * @returns A {@link VerificationResult} describing the contributor's status.
+ * @throws If heka-identity-service is unreachable or returns a 5xx error.
+ */
+export async function verifyContributor(githubUsername: string): Promise<VerificationResult> {
+  const response = await axios.get<VerificationResult>(
+    `${HEKA_GPG_PATH}/status/${encodeURIComponent(githubUsername)}`,
+    {
+      // Fail fast if the identity service is down rather than blocking
+      // Probot's handler thread for the full default timeout.
+      timeout: 5_000,
+    },
+  );
 
-  return response.data
+  return response.data;
 }
