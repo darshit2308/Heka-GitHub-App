@@ -1,6 +1,32 @@
 import axios from 'axios';
-import { HEKA_GPG_PATH } from '../config/env.ts';
+import { HEKA_GPG_PATH, HEKA_PRESENTATION_PATH } from '../config/env.ts';
 import type { VerificationResult } from '../types/verification.ts';
+
+export interface PresentationSessionRequest {
+  githubAccountId: string;
+  githubUsername: string;
+  installationId: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}
+
+export interface PresentationSessionResult {
+  sessionId: string;
+  state: string;
+  sessionUrl: string;
+  alreadySatisfied: boolean;
+  humanReason?: string;
+}
+
+function statusToken(): string {
+  const token = process.env.HEKA_STATUS_TOKEN;
+  if (!token) {
+    throw new Error('HEKA_STATUS_TOKEN is not set');
+  }
+  return token;
+}
 
 /**
  * Queries the Heka identity service to determine whether a contributor has
@@ -27,8 +53,36 @@ export async function verifyContributor(githubUsername: string): Promise<Verific
       // Fail fast if the identity service is down rather than blocking
       // Probot's handler thread for the full default timeout.
       timeout: 5_000,
+      headers: { Authorization: `Bearer ${statusToken()}` },
     },
   );
 
   return response.data;
+}
+
+/**
+ * Opens the OID4VP session for this pull request. The returned page URL is the
+ * GitHub check `details_url`. A recent successful presentation for the same
+ * GitHub account comes back with `alreadySatisfied`.
+ */
+export async function openPresentationSession(
+  request: PresentationSessionRequest,
+): Promise<PresentationSessionResult> {
+  const response = await axios.post<PresentationSessionResult>(HEKA_PRESENTATION_PATH, request, {
+    timeout: 10_000,
+    headers: { Authorization: `Bearer ${statusToken()}` },
+  });
+  return response.data;
+}
+
+/** Stores the check run id on the session so a later result can update that check. */
+export async function attachPresentationCheckRun(sessionId: string, checkRunId: string): Promise<void> {
+  await axios.patch(
+    `${HEKA_PRESENTATION_PATH}/${encodeURIComponent(sessionId)}/check-run`,
+    { checkRunId },
+    {
+      timeout: 5_000,
+      headers: { Authorization: `Bearer ${statusToken()}` },
+    },
+  );
 }

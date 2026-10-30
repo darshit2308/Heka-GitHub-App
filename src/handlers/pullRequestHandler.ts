@@ -1,6 +1,9 @@
 import { Context, Probot } from 'probot';
-import { verifyContributor } from '../services/hekaService.ts';
-import type { VerificationResult } from '../types/verification.ts';
+import {
+  attachPresentationCheckRun,
+  openPresentationSession,
+  type PresentationSessionResult,
+} from '../services/hekaService.ts';
 
 /** The canonical name used for all check runs created by this App. */
 const CHECK_NAME = 'Heka Identity Verification';
@@ -10,47 +13,30 @@ const CHECK_NAME = 'Heka Identity Verification';
  * `pull_request.reopened` webhook events.
  *
  * Flow:
- *   1. **Idempotency guard** — before creating anything, list existing check
- *      runs for this commit SHA.  If a non-queued check run named
- *      {@link CHECK_NAME} already exists for the same SHA, the event is a
- *      re-delivery of a webhook we already processed; skip it.
- *   2. Create an `in_progress` check run immediately so the PR shows
- *      a "pending" badge while the identity service is queried.
- *   3. Call heka-identity-service to determine verification status.
- *   4. Update (complete) the check run with a `success` or `failure`
- *      conclusion and a human-readable output block.
+ *   1. Skip the delivery when this commit already has a Heka check run.
+ *   2. Ask the identity service for an OID4VP session. The session page is
+ *      the check's `details_url`.
+ *   3. Create the check as Action Required, or as success when a presentation
+ *      from this GitHub account already succeeded inside the last 15 minutes.
+ *   4. Store the check run id on the session. The identity service updates
+ *      that check when the wallet presents, or when the session times out.
  *
- * **Error isolation:** Heka API failures (network errors, 5xx responses)
- * are caught inside this handler so a service outage never causes Probot to
- * emit an unhandled-rejection.  In that case the check run is completed with
- * `failure` and a message directing the contributor to retry.
- *
- * @param app     - Probot instance (used for structured logging only).
- * @param context - Webhook event context providing the payload and Octokit client.
+ * If the identity service is unreachable, the check is completed as a failure
+ * so the pull request is not left without a result.
  */
 export async function handlePullRequestEvent(
   app: Probot,
   context: Context<'pull_request.opened' | 'pull_request.synchronize' | 'pull_request.reopened'>,
 ): Promise<void> {
   const username = context.payload.pull_request.user.login;
+  const accountId = String(context.payload.pull_request.user.id);
   const sha = context.payload.pull_request.head.sha;
   const prNumber = context.payload.pull_request.number;
+  const installationId = String(context.payload.installation?.id ?? '');
   const repoInfo = context.repo();
 
-  app.log.info(`PR #${prNumber} from @${username} (SHA: ${sha.slice(0, 7)}) — starting identity check.`);
+  app.log.info(`PR #${prNumber} from @${username} (SHA: ${sha.slice(0, 7)}) — opening identity verification.`);
 
-  // ---------------------------------------------------------------------------
-  // Step 1: Idempotency guard
-  //
-  // GitHub delivers webhooks on an "at least once" basis: the same payload may
-  // be re-delivered if an earlier delivery timed out or failed.  Without this
-  // check, a re-delivery would create a duplicate check run on the PR.
-  //
-  // A check run is considered "already processed" if:
-  //   - its name matches CHECK_NAME, AND
-  //   - its head_sha matches the current commit, AND
-  //   - its status is not 'queued' (queued means it was created but not yet started)
-  // ---------------------------------------------------------------------------
   const existingRuns = await context.octokit.checks.listForRef({
     ...repoInfo,
     ref: sha,
@@ -59,86 +45,70 @@ export async function handlePullRequestEvent(
   });
 
   const alreadyProcessed = existingRuns.data.check_runs.some(
-    (run) => run.head_sha === sha && run.status !== 'queued',
+    (run) => run.name === CHECK_NAME && run.head_sha === sha && run.status !== 'queued',
   );
 
   if (alreadyProcessed) {
-    app.log.info(
-      `Idempotency: check run for SHA ${sha.slice(0, 7)} already exists — skipping re-delivery.`,
-    );
+    app.log.info(`Idempotency: check run for SHA ${sha.slice(0, 7)} already exists — skipping re-delivery.`);
     return;
   }
 
-  // ---------------------------------------------------------------------------
-  // Step 2: Create in_progress check run
-  //
-  // This appears immediately in the PR's "Checks" panel, giving the contributor
-  // real-time feedback that verification is running.
-  // Capture the check run id so we can update (not duplicate) it below.
-  // ---------------------------------------------------------------------------
+  let session: PresentationSessionResult;
+  try {
+    session = await openPresentationSession({
+      githubAccountId: accountId,
+      githubUsername: username,
+      installationId,
+      owner: repoInfo.owner,
+      repo: repoInfo.repo,
+      prNumber,
+      headSha: sha,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    app.log.error(`Heka API call failed for @${username}: ${message}`);
+    await context.octokit.checks.create({
+      ...repoInfo,
+      name: CHECK_NAME,
+      head_sha: sha,
+      status: 'completed',
+      conclusion: 'failure',
+      output: {
+        title: 'Contributor verification unavailable',
+        summary:
+          `The Heka identity service did not open a verification session for **@${username}**.\n\n` +
+          `Push another commit to this pull request to try again.`,
+      },
+    });
+    return;
+  }
+
   const { data: checkRun } = await context.octokit.checks.create({
     ...repoInfo,
     name: CHECK_NAME,
     head_sha: sha,
-    status: 'in_progress',
+    status: 'completed',
+    conclusion: session.alreadySatisfied ? 'success' : 'action_required',
+    details_url: session.sessionUrl,
+    output: session.alreadySatisfied
+      ? {
+          title: 'Contributor identity verified',
+          summary:
+            session.humanReason ??
+            `**@${username}** already presented a contributor credential within the last 15 minutes.`,
+        }
+      : {
+          title: 'Contributor verification required',
+          summary:
+            `**@${username}** needs to present their Heka contributor credential.\n\n` +
+            `Open the details page. The Heka wallet presents the credential, and this check updates when verification finishes.`,
+        },
   });
 
-  // ---------------------------------------------------------------------------
-  // Step 3: Query heka-identity-service
-  // ---------------------------------------------------------------------------
-  let verificationResult: VerificationResult = { isVerified: false, githubUsername: username };
-
   try {
-    verificationResult = await verifyContributor(username);
+    await attachPresentationCheckRun(session.sessionId, String(checkRun.id));
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    app.log.error(`Heka API call failed for @${username}: ${message}`);
-    // verificationResult stays { isVerified: false } — we fall through to the
-    // failure check run below with a service-outage message.
-  }
-
-  // ---------------------------------------------------------------------------
-  // Step 4: Update the existing check run to completed
-  //
-  // Using checks.update (not a second checks.create) so the PR Checks panel
-  // shows a single entry that transitions from "in progress" → pass/fail.
-  // ---------------------------------------------------------------------------
-  if (verificationResult.isVerified) {
-    app.log.info(`✓ Identity verified for @${username} — fingerprint: ${verificationResult.gpgFingerprint}`);
-
-    await context.octokit.checks.update({
-      ...repoInfo,
-      check_run_id: checkRun.id,
-      status: 'completed',
-      conclusion: 'success',
-      output: {
-        title: 'Contributor Identity Verified ✅',
-        summary:
-          `**@${username}** has proved ownership of their GitHub GPG key through the ` +
-          `Heka cryptographic challenge-response protocol.\n\n` +
-          `**GPG Key Fingerprint:** \`${verificationResult.gpgFingerprint}\`\n` +
-          `**Verified at:** ${verificationResult.verifiedAt ?? 'unknown'}`,
-      },
-    });
-  } else {
-    app.log.warn(`✗ Verification not found for @${username}`);
-
-    await context.octokit.checks.update({
-      ...repoInfo,
-      check_run_id: checkRun.id,
-      status: 'completed',
-      conclusion: 'failure',
-      output: {
-        title: 'Unverified Contributor ❌',
-        summary:
-          `No verified GPG identity was found for **@${username}**.\n\n` +
-          `To contribute to this repository you must complete the Heka identity ` +
-          `verification process:\n\n` +
-          `1. Visit the **Heka Contributor Portal** to begin onboarding.\n` +
-          `2. Request a GPG ownership challenge for your GitHub account.\n` +
-          `3. Sign the challenge nonce with your GPG private key and submit the proof.\n\n` +
-          `Once verified, re-open or push a new commit to this pull request.`,
-      },
-    });
+    app.log.error(`Could not store check run ${checkRun.id} on session ${session.sessionId}: ${message}`);
   }
 }
