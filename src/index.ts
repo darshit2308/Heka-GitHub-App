@@ -1,5 +1,5 @@
 import { Probot } from 'probot';
-import { handlePullRequestEvent } from './handlers/pullRequestHandler.ts';
+import { handlePullRequestClosed, handlePullRequestEvent } from './handlers/pullRequestHandler.ts';
 
 /**
  * Heka GitHub App entry point.
@@ -19,13 +19,18 @@ export default (app: Probot): void => {
   app.log.info('Heka identity verification bot is live and listening.');
 
   // Trigger on all PR lifecycle events that can introduce new commits.
-  // - opened:      first PR creation
-  // - synchronize: new push to an existing PR branch
-  // - reopened:    PR re-opened after being closed without merge
+  // - opened:           first PR creation
+  // - synchronize:      new push to an existing PR branch
+  // - reopened:         PR re-opened after being closed without merge
+  // - ready_for_review: a draft was marked ready and should be verified
   app.on(
-    ['pull_request.opened', 'pull_request.synchronize', 'pull_request.reopened'],
+    ['pull_request.opened', 'pull_request.synchronize', 'pull_request.reopened', 'pull_request.ready_for_review'],
     async (context) => {
       await handlePullRequestEvent(app, context);
     },
   );
+
+  app.on('pull_request.closed', async (context) => {
+    await handlePullRequestClosed(app, context);
+  });
 };

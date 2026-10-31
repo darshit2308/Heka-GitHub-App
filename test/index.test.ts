@@ -25,6 +25,22 @@ const synchronizePayload = JSON.parse(
 
 const reopenedPayload = { ...openedPayload, action: 'reopened' };
 
+const draftPayload = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/pull_request.draft.json'), 'utf-8'),
+);
+
+const readyPayload = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/pull_request.ready.json'), 'utf-8'),
+);
+
+const closedPayload = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/pull_request.closed.json'), 'utf-8'),
+);
+
+const forkPayload = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/pull_request.fork.json'), 'utf-8'),
+);
+
 const sessionUrl = 'http://localhost:8000/contributor/verify/sess-1';
 
 function mockGitHubPreamble(
@@ -346,6 +362,139 @@ describe('Heka Identity Verification Bot', () => {
       .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
 
     const hekaMock = mockOpenSession({ alreadySatisfied: false }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ name: 'pull_request', payload: openedPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+    expect(hekaMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('posts a neutral check for a draft and does not open a session', async () => {
+    const sha = draftPayload.pull_request.head.sha;
+    const githubMock = nock('https://api.github.com')
+      .post('/app/installations/2/access_tokens')
+      .reply(200, { token: 'test', permissions: { checks: 'write' } })
+      .get(`/repos/test-org/test-repo/commits/${sha}/check-runs`)
+      .query({ check_name: 'Heka Identity Verification', filter: 'latest' })
+      .reply(200, { total_count: 0, check_runs: [] })
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('neutral');
+        expect((body.output as { title: string }).title).toBe('Draft pull request');
+        expect((body.output as { summary: string }).summary).toBe(
+          'Verification runs when this pull request is marked ready.',
+        );
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+
+    const hekaMock = nock(HEKA_URL).post('/v2/presentation-session').reply(500);
+
+    await probot.receive({ name: 'pull_request', payload: draftPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+    expect(hekaMock.pendingMocks()).toStrictEqual([`POST ${HEKA_URL}/v2/presentation-session`]);
+    nock.cleanAll();
+  });
+
+  test('opens a session when a draft is marked ready for review', async () => {
+    const sha = readyPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha, [
+      {
+        id: 1,
+        name: 'Heka Identity Verification',
+        head_sha: sha,
+        status: 'completed',
+        conclusion: 'neutral',
+        output: { title: 'Draft pull request', summary: 'Verification runs when this pull request is marked ready.' },
+      },
+    ])
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('action_required');
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+
+    const hekaMock = mockOpenSession({ alreadySatisfied: false }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ name: 'pull_request', payload: readyPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+    expect(hekaMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('ignores a repeated webhook delivery id', async () => {
+    const sha = openedPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha)
+      .post('/repos/test-org/test-repo/check-runs')
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+    mockOpenSession({ alreadySatisfied: false }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ id: 'delivery-1', name: 'pull_request', payload: openedPayload });
+    await probot.receive({ id: 'delivery-1', name: 'pull_request', payload: openedPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('closes open sessions when the pull request is closed and does not create a check', async () => {
+    const closeMock = nock(HEKA_URL)
+      .post('/v2/presentation-session/close', (body: Record<string, unknown>) => {
+        expect(body).toEqual({ owner: 'test-org', repo: 'test-repo', prNumber: 42 });
+        return true;
+      })
+      .matchHeader('authorization', 'Bearer test-status-token')
+      .reply(200, { closed: 1 });
+
+    await probot.receive({ name: 'pull_request', payload: closedPayload });
+
+    expect(closeMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('verifies a forked pull request as its author and says the change comes from a fork', async () => {
+    const sha = forkPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha)
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('action_required');
+        expect((body.output as { summary: string }).summary).toContain(
+          'This pull request comes from a fork. The author is @test-contributor.',
+        );
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+
+    const hekaMock = mockOpenSession({ alreadySatisfied: false }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ name: 'pull_request', payload: forkPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+    expect(hekaMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('retries the session open once when the identity service is unreachable', async () => {
+    const sha = openedPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha)
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('action_required');
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+
+    const refused = new Error('connect ECONNREFUSED');
+    (refused as NodeJS.ErrnoException).code = 'ECONNREFUSED';
+    const hekaMock = nock(HEKA_URL)
+      .post('/v2/presentation-session')
+      .replyWithError(refused)
+      .post('/v2/presentation-session')
+      .reply(201, {
+        sessionId: 'sess-1',
+        state: 'pending',
+        sessionUrl,
+        alreadySatisfied: false,
+        disposition: 'verify',
+      });
     mockAttachCheckRun();
 
     await probot.receive({ name: 'pull_request', payload: openedPayload });
