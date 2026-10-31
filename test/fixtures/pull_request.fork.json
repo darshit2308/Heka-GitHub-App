@@ -1,0 +1,35 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "draft": false,
+    "title": "Add contributor verification docs",
+    "user": {
+      "login": "test-contributor",
+      "id": 12345
+    },
+    "head": {
+      "sha": "abc123def456",
+      "ref": "feature/verification-docs",
+      "repo": {
+        "full_name": "contributor-fork/test-repo"
+      }
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "id": 1,
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "installation": {
+    "id": 2
+  }
+}
