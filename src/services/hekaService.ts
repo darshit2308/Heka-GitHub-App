@@ -10,6 +10,7 @@ export interface PresentationSessionRequest {
   repo: string;
   prNumber: number;
   headSha: string;
+  policyYaml?: string;
 }
 
 export interface PresentationSessionResult {
@@ -18,6 +19,7 @@ export interface PresentationSessionResult {
   sessionUrl: string;
   alreadySatisfied: boolean;
   humanReason?: string;
+  disposition?: 'skip' | 'grace' | 'verify';
 }
 
 function statusToken(): string {

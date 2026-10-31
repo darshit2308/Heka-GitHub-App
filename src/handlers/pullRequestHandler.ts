@@ -53,6 +53,8 @@ export async function handlePullRequestEvent(
     return;
   }
 
+  const policyYaml = await readDefaultBranchPolicy(app, context);
+
   let session: PresentationSessionResult;
   try {
     session = await openPresentationSession({
@@ -63,6 +65,7 @@ export async function handlePullRequestEvent(
       repo: repoInfo.repo,
       prNumber,
       headSha: sha,
+      policyYaml,
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -83,26 +86,18 @@ export async function handlePullRequestEvent(
     return;
   }
 
+  const posted = postedCheck(session, username);
   const { data: checkRun } = await context.octokit.checks.create({
     ...repoInfo,
     name: CHECK_NAME,
     head_sha: sha,
     status: 'completed',
-    conclusion: session.alreadySatisfied ? 'success' : 'action_required',
+    conclusion: posted.conclusion,
     details_url: session.sessionUrl,
-    output: session.alreadySatisfied
-      ? {
-          title: 'Contributor identity verified',
-          summary:
-            session.humanReason ??
-            `**@${username}** already presented a contributor credential within the last 15 minutes.`,
-        }
-      : {
-          title: 'Contributor verification required',
-          summary:
-            `**@${username}** needs to present their Heka contributor credential.\n\n` +
-            `Open the details page. The Heka wallet presents the credential, and this check updates when verification finishes.`,
-        },
+    output: {
+      title: posted.title,
+      summary: posted.summary,
+    },
   });
 
   try {
@@ -111,4 +106,70 @@ export async function handlePullRequestEvent(
     const message = error instanceof Error ? error.message : String(error);
     app.log.error(`Could not store check run ${checkRun.id} on session ${session.sessionId}: ${message}`);
   }
+}
+
+/**
+ * Reads `.heka/config.yml` from the repository default branch only.
+ * A missing file or any contents error omits the document so the identity
+ * service falls back to warn mode. The file is never logged.
+ */
+async function readDefaultBranchPolicy(
+  app: Probot,
+  context: Context<'pull_request.opened' | 'pull_request.synchronize' | 'pull_request.reopened'>,
+): Promise<string | undefined> {
+  const defaultBranch = context.payload.repository.default_branch;
+  if (!defaultBranch) {
+    app.log.warn(`No default branch on ${context.payload.repository.full_name}; opening the session without a policy file.`);
+    return undefined;
+  }
+
+  try {
+    const { data } = await context.octokit.repos.getContent({
+      ...context.repo(),
+      path: '.heka/config.yml',
+      ref: defaultBranch,
+    });
+    if (Array.isArray(data) || !('content' in data) || typeof data.content !== 'string') {
+      app.log.warn(`.heka/config.yml on ${defaultBranch} is not a file; opening the session without a policy file.`);
+      return undefined;
+    }
+    const decoded = Buffer.from(data.content, 'base64').toString('utf8');
+    return decoded.trim() === '' ? undefined : decoded;
+  } catch (error: unknown) {
+    const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : undefined;
+    if (status !== 404) {
+      const message = error instanceof Error ? error.message : String(error);
+      app.log.warn(`Could not read .heka/config.yml from ${defaultBranch}: ${message}`);
+    }
+    return undefined;
+  }
+}
+
+function postedCheck(
+  session: PresentationSessionResult,
+  username: string,
+): { conclusion: 'neutral' | 'success' | 'action_required'; title: string; summary: string } {
+  if (session.disposition === 'skip') {
+    return {
+      conclusion: 'neutral',
+      title: 'Contributor verification disabled',
+      summary: session.humanReason ?? 'Verification is disabled for this repository.',
+    };
+  }
+  if (session.disposition === 'grace' || session.alreadySatisfied) {
+    return {
+      conclusion: 'success',
+      title: 'Contributor identity verified',
+      summary:
+        session.humanReason ??
+        `**@${username}** already presented a contributor credential within the last 15 minutes.`,
+    };
+  }
+  return {
+    conclusion: 'action_required',
+    title: 'Contributor verification required',
+    summary:
+      `**@${username}** needs to present their Heka contributor credential.\n\n` +
+      `Open the details page. The Heka wallet presents the credential, and this check updates when verification finishes.`,
+  };
 }
