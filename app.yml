@@ -34,3 +34,8 @@ default_permissions:
   # Required to read PR payload data (author, head SHA, etc.)
   # https://developer.github.com/v3/apps/permissions/#permission-on-pull-requests
   pull_requests: read
+
+  # Read .heka/config.yml from the repository default branch.
+  # Installed apps must accept this permission before policy files are visible.
+  # https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
+  contents: read
