@@ -1,5 +1,5 @@
 import axios, { isAxiosError } from 'axios';
-import { HEKA_PRESENTATION_PATH } from '../config/env.ts';
+import { HEKA_PRESENTATION_PATH } from '../config/env.js';
 
 export interface PresentationSessionRequest {
   githubAccountId: string;
@@ -19,6 +19,7 @@ export interface PresentationSessionResult {
   alreadySatisfied: boolean;
   humanReason?: string;
   disposition?: 'skip' | 'grace' | 'verify';
+  configWarning?: string;
 }
 
 export interface ClosePresentationRequest {
@@ -50,6 +51,80 @@ export async function openPresentationSession(
     }),
   );
   return response.data;
+}
+
+export interface RemoteWebhookJob {
+  deliveryId: string;
+  event: {
+    action: string;
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    githubAccountId: string;
+    githubUsername: string;
+    installationId: string;
+    draft: boolean;
+    fork: boolean;
+    defaultBranch?: string;
+  };
+  checkRunId?: string;
+}
+
+/** Leases this delivery in the identity service. Skip means another worker holds it or it is finished. */
+export async function acceptWebhookJob(event: RemoteWebhookJob['event'] & { deliveryId: string }): Promise<{
+  disposition: 'run' | 'skip';
+  status: string;
+  checkRunId?: string;
+}> {
+  const { deliveryId, ...body } = event;
+  const response = await withNetworkRetry(() =>
+    axios.post<{ disposition: 'run' | 'skip'; status: string; checkRunId?: string }>(
+      `${HEKA_PRESENTATION_PATH}/deliveries`,
+      { deliveryId, event: body },
+      {
+        timeout: 5_000,
+        headers: { Authorization: `Bearer ${statusToken()}` },
+      },
+    ),
+  );
+  return response.data;
+}
+
+export async function recordWebhookCheck(deliveryId: string, checkRunId: string): Promise<void> {
+  await withNetworkRetry(() =>
+    axios.patch(
+      `${HEKA_PRESENTATION_PATH}/deliveries/${encodeURIComponent(deliveryId)}`,
+      { checkRunId },
+      {
+        timeout: 5_000,
+        headers: { Authorization: `Bearer ${statusToken()}` },
+      },
+    ),
+  );
+}
+
+export async function finishWebhookJob(deliveryId: string, status: 'completed' | 'failed'): Promise<void> {
+  await withNetworkRetry(() =>
+    axios.patch(
+      `${HEKA_PRESENTATION_PATH}/deliveries/${encodeURIComponent(deliveryId)}`,
+      { status },
+      {
+        timeout: 5_000,
+        headers: { Authorization: `Bearer ${statusToken()}` },
+      },
+    ),
+  );
+}
+
+export async function leaseAbandonedWebhookJobs(): Promise<RemoteWebhookJob[]> {
+  const response = await withNetworkRetry(() =>
+    axios.get<{ jobs: RemoteWebhookJob[] }>(`${HEKA_PRESENTATION_PATH}/deliveries/abandoned`, {
+      timeout: 5_000,
+      headers: { Authorization: `Bearer ${statusToken()}` },
+    }),
+  );
+  return response.data.jobs;
 }
 
 /** Stores the check run id on the session so a later result can update that check. */

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { describe, beforeEach, afterEach, test, expect } from 'vitest';
 
 import { HEKA_PRESENTATION_PATH, HEKA_URL } from '../src/config/env.js';
+import { resetWebhookJobsForTests } from '../src/handlers/webhook-job-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,6 +74,7 @@ function mockOpenSession(
     alreadySatisfied: boolean;
     humanReason?: string;
     disposition?: 'skip' | 'grace' | 'verify';
+    configWarning?: string;
   },
   sha: string,
   policyYaml?: string,
@@ -105,6 +107,7 @@ function mockOpenSession(
       alreadySatisfied: result.alreadySatisfied,
       humanReason: result.humanReason,
       disposition: result.disposition ?? 'verify',
+      configWarning: result.configWarning,
     });
 }
 
@@ -121,6 +124,7 @@ describe('Heka Identity Verification Bot', () => {
   let probot: Probot;
 
   beforeEach(() => {
+    resetWebhookJobsForTests();
     process.env.HEKA_STATUS_TOKEN = 'test-status-token';
     nock.disableNetConnect();
     probot = new Probot({
@@ -136,6 +140,7 @@ describe('Heka Identity Verification Bot', () => {
 
   afterEach(() => {
     delete process.env.HEKA_STATUS_TOKEN;
+    delete process.env.PRIVATE_KEY_PATH;
     nock.cleanAll();
     nock.enableNetConnect();
   });
@@ -436,6 +441,90 @@ describe('Heka Identity Verification Bot', () => {
     await probot.receive({ id: 'delivery-1', name: 'pull_request', payload: openedPayload });
 
     expect(githubMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('starts a new session when a pull request is reopened on a commit that already failed', async () => {
+    const sha = reopenedPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha, [
+      {
+        id: 7,
+        name: 'Heka Identity Verification',
+        head_sha: sha,
+        status: 'completed',
+        conclusion: 'failure',
+        output: {
+          title: 'Contributor verification failed',
+          summary: 'The pull request was closed before verification finished.',
+        },
+      },
+    ])
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('action_required');
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+    const hekaMock = mockOpenSession({ alreadySatisfied: false }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ name: 'pull_request', payload: reopenedPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+    expect(hekaMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('completes the check as failure when the session cannot store the check run', async () => {
+    const sha = openedPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha)
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('action_required');
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' })
+      .patch('/repos/test-org/test-repo/check-runs/42', (body: Record<string, unknown>) => {
+        expect(body.conclusion).toBe('failure');
+        expect((body.output as { title: string }).title).toBe('Contributor verification could not be linked');
+        expect((body.output as { summary: string }).summary).toContain('Push another commit');
+        return true;
+      })
+      .reply(200, { id: 42 });
+    mockOpenSession({ alreadySatisfied: false }, sha);
+    nock(HEKA_PRESENTATION_PATH).patch('/sess-1/check-run').reply(500, { message: 'unavailable' });
+
+    await probot.receive({ name: 'pull_request', payload: openedPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('tells the maintainer when the repository policy file is invalid', async () => {
+    const sha = openedPayload.pull_request.head.sha;
+    const githubMock = mockGitHubPreamble(sha)
+      .post('/repos/test-org/test-repo/check-runs', (body: Record<string, unknown>) => {
+        expect((body.output as { summary: string }).summary).toContain(
+          'The repository policy file is invalid. Verification is using warn mode until .heka/config.yml is fixed.',
+        );
+        return true;
+      })
+      .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
+    mockOpenSession({ alreadySatisfied: false, configWarning: 'repository_config_invalid' }, sha);
+    mockAttachCheckRun();
+
+    await probot.receive({ name: 'pull_request', payload: openedPayload });
+
+    expect(githubMock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test('refuses a private key path inside the repository', async () => {
+    process.env.PRIVATE_KEY_PATH = path.join(__dirname, '..', 'private-key.pem');
+    const next = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults({
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      }),
+    });
+
+    await expect(next.load(myProbotApp)).rejects.toThrow(/PRIVATE_KEY_PATH points inside this repository/);
   });
 
   test('closes open sessions when the pull request is closed and does not create a check', async () => {

@@ -11,6 +11,10 @@ npm install
 # Copy and fill local configuration
 cp .env.example .env
 
+# Put the GitHub App private key in PRIVATE_KEY. Do not commit a .pem file.
+# If a key was ever committed, revoke it in the GitHub App settings.
+# Deleting the file does not remove it from git history.
+
 # Build the production entrypoint
 npm run build
 

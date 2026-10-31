@@ -1,5 +1,31 @@
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 import { Probot } from 'probot';
-import { handlePullRequestClosed, handlePullRequestEvent } from './handlers/pullRequestHandler.ts';
+import {
+  handlePullRequestClosed,
+  handlePullRequestEvent,
+  resumeAbandonedPullRequests,
+} from './handlers/pullRequestHandler.js';
+import { startAbandonedJobRecovery } from './handlers/webhook-recovery.js';
+import { installProductionWebhookJobStore } from './handlers/webhook-job-store.js';
+
+/**
+ * Probot reads PRIVATE_KEY from the environment. A path inside this
+ * repository is refused so a committed key cannot stay in use.
+ */
+function assertRuntimeKeyIsOutsideTheRepo(): void {
+  const configured = process.env.PRIVATE_KEY_PATH;
+  if (!configured) return;
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const relative = path.relative(repoRoot, path.resolve(configured));
+  const inside = relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+  if (inside) {
+    throw new Error(
+      'PRIVATE_KEY_PATH points inside this repository. Set PRIVATE_KEY from an environment secret, and revoke any key that was committed.',
+    );
+  }
+}
 
 /**
  * Heka GitHub App entry point.
@@ -16,6 +42,18 @@ import { handlePullRequestClosed, handlePullRequestEvent } from './handlers/pull
  * @param app - Probot application instance.
  */
 export default (app: Probot): void => {
+  assertRuntimeKeyIsOutsideTheRepo();
+  if (process.env.NODE_ENV !== 'test') {
+    installProductionWebhookJobStore();
+    startAbandonedJobRecovery(async (now) => {
+      try {
+        await resumeAbandonedPullRequests(app, now);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        app.log.error(`Could not resume webhook jobs. ${message}`);
+      }
+    });
+  }
   app.log.info('Heka identity verification bot is live and listening.');
 
   // Trigger on all PR lifecycle events that can introduce new commits.
