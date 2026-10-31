@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { describe, beforeEach, afterEach, test, expect } from 'vitest';
 
 import { HEKA_PRESENTATION_PATH, HEKA_URL } from '../src/config/env.js';
+import { resetWebhookJobsForTests } from '../src/handlers/webhook-job-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -123,6 +124,7 @@ describe('Heka Identity Verification Bot', () => {
   let probot: Probot;
 
   beforeEach(() => {
+    resetWebhookJobsForTests();
     process.env.HEKA_STATUS_TOKEN = 'test-status-token';
     nock.disableNetConnect();
     probot = new Probot({
@@ -429,11 +431,6 @@ describe('Heka Identity Verification Bot', () => {
 
   test('ignores a repeated webhook delivery id', async () => {
     const sha = openedPayload.pull_request.head.sha;
-    const claim = nock(HEKA_URL)
-      .post('/v2/presentation-session/deliveries', { deliveryId: 'delivery-1' })
-      .reply(200, { claimed: true })
-      .post('/v2/presentation-session/deliveries', { deliveryId: 'delivery-1' })
-      .reply(200, { claimed: false });
     const githubMock = mockGitHubPreamble(sha)
       .post('/repos/test-org/test-repo/check-runs')
       .reply(201, { id: 42, name: 'Heka Identity Verification', status: 'completed' });
@@ -443,7 +440,6 @@ describe('Heka Identity Verification Bot', () => {
     await probot.receive({ id: 'delivery-1', name: 'pull_request', payload: openedPayload });
     await probot.receive({ id: 'delivery-1', name: 'pull_request', payload: openedPayload });
 
-    expect(claim.pendingMocks()).toStrictEqual([]);
     expect(githubMock.pendingMocks()).toStrictEqual([]);
   });
 
