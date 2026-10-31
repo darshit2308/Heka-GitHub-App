@@ -1,6 +1,6 @@
 /**
- * Remembers webhook delivery ids for this process only.
- * A second instance does not see them. There is no Redis.
+ * Fallback when the identity service cannot record a delivery id.
+ * This map is per process, disappears on restart, and is not multi-instance idempotency.
  */
 const seenDeliveries = new Map<string, number>();
 const DELIVERY_TTL_MS = 10 * 60 * 1000;

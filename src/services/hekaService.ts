@@ -1,5 +1,5 @@
 import axios, { isAxiosError } from 'axios';
-import { HEKA_PRESENTATION_PATH } from '../config/env.ts';
+import { HEKA_PRESENTATION_PATH } from '../config/env.js';
 
 export interface PresentationSessionRequest {
   githubAccountId: string;
@@ -19,6 +19,7 @@ export interface PresentationSessionResult {
   alreadySatisfied: boolean;
   humanReason?: string;
   disposition?: 'skip' | 'grace' | 'verify';
+  configWarning?: string;
 }
 
 export interface ClosePresentationRequest {
@@ -50,6 +51,21 @@ export async function openPresentationSession(
     }),
   );
   return response.data;
+}
+
+/** Claims a webhook delivery id. False means this delivery was already handled. */
+export async function claimWebhookDelivery(deliveryId: string): Promise<boolean> {
+  const response = await withNetworkRetry(() =>
+    axios.post<{ claimed: boolean }>(
+      `${HEKA_PRESENTATION_PATH}/deliveries`,
+      { deliveryId },
+      {
+        timeout: 5_000,
+        headers: { Authorization: `Bearer ${statusToken()}` },
+      },
+    ),
+  );
+  return response.data.claimed === true;
 }
 
 /** Stores the check run id on the session so a later result can update that check. */

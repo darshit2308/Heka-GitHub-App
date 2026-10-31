@@ -1,11 +1,12 @@
 import { Context, Probot } from 'probot';
-import { alreadyDelivered } from './delivery-memory.ts';
+import { alreadyDelivered } from './delivery-memory.js';
 import {
   attachPresentationCheckRun,
+  claimWebhookDelivery,
   closePresentationSessions,
   openPresentationSession,
   type PresentationSessionResult,
-} from '../services/hekaService.ts';
+} from '../services/hekaService.js';
 
 /** The canonical name used for all check runs created by this App. */
 const CHECK_NAME = 'Heka Identity Verification';
@@ -43,7 +44,7 @@ export async function handlePullRequestEvent(
   const installationId = String(context.payload.installation?.id ?? '');
   const repoInfo = context.repo();
 
-  if (alreadyDelivered(context.id)) return;
+  if (await deliveryAlreadyHandled(app, context.id)) return;
 
   app.log.info(
     `deliveryId=${context.id ?? ''} owner=${repoInfo.owner} repo=${repoInfo.repo} prNumber=${prNumber} sha=${sha} action=${context.payload.action}`,
@@ -58,7 +59,9 @@ export async function handlePullRequestEvent(
 
   const alreadyProcessed = existingRuns.data.check_runs.some((run) => {
     if (run.name !== CHECK_NAME || run.head_sha !== sha || run.status === 'queued') return false;
-    return !(context.payload.action === 'ready_for_review' && run.output?.title === 'Draft pull request');
+    if (context.payload.action === 'ready_for_review' && run.output?.title === 'Draft pull request') return false;
+    if (context.payload.action === 'reopened') return false;
+    return true;
   });
 
   if (alreadyProcessed) {
@@ -138,6 +141,19 @@ export async function handlePullRequestEvent(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     app.log.error(`Could not store check run ${checkRun.id} on session ${session.sessionId}: ${message}`);
+    if (posted.conclusion !== 'action_required') return;
+    await context.octokit.checks.update({
+      ...repoInfo,
+      check_run_id: checkRun.id,
+      status: 'completed',
+      conclusion: 'failure',
+      output: {
+        title: 'Contributor verification could not be linked',
+        summary:
+          `A verification session was opened for **@${username}**, but this check could not be attached to it.\n\n` +
+          `Push another commit to this pull request to try again.`,
+      },
+    });
   }
 }
 
@@ -149,7 +165,7 @@ export async function handlePullRequestClosed(
   const sha = context.payload.pull_request.head.sha;
   const prNumber = context.payload.pull_request.number;
   const repoInfo = context.repo();
-  if (alreadyDelivered(context.id)) return;
+  if (await deliveryAlreadyHandled(app, context.id)) return;
 
   app.log.info(
     `deliveryId=${context.id ?? ''} owner=${repoInfo.owner} repo=${repoInfo.repo} prNumber=${prNumber} sha=${sha} action=${context.payload.action}`,
@@ -209,24 +225,41 @@ async function readDefaultBranchPolicy(
   }
 }
 
+async function deliveryAlreadyHandled(app: Probot, deliveryId: string | undefined): Promise<boolean> {
+  if (!deliveryId) return false;
+  try {
+    const claimed = await claimWebhookDelivery(deliveryId);
+    return !claimed;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    app.log.warn(`Could not record delivery ${deliveryId}. Falling back to this process only. ${message}`);
+    return alreadyDelivered(deliveryId);
+  }
+}
+
 function postedCheck(
   session: PresentationSessionResult,
   username: string,
 ): { conclusion: 'neutral' | 'success' | 'action_required'; title: string; summary: string } {
+  const invalidPolicy =
+    session.configWarning === 'repository_config_invalid'
+      ? '\n\nThe repository policy file is invalid. Verification is using warn mode until .heka/config.yml is fixed.'
+      : '';
   if (session.disposition === 'skip') {
     return {
       conclusion: 'neutral',
       title: 'Contributor verification disabled',
-      summary: session.humanReason ?? 'Verification is disabled for this repository.',
+      summary: `${session.humanReason ?? 'Verification is disabled for this repository.'}${invalidPolicy}`,
     };
   }
   if (session.disposition === 'grace' || session.alreadySatisfied) {
     return {
       conclusion: 'success',
       title: 'Contributor identity verified',
-      summary:
+      summary: `${
         session.humanReason ??
-        `**@${username}** already presented a contributor credential within the last 15 minutes.`,
+        `**@${username}** already presented a contributor credential within the last 15 minutes.`
+      }${invalidPolicy}`,
     };
   }
   return {
@@ -234,6 +267,7 @@ function postedCheck(
     title: 'Contributor verification required',
     summary:
       `**@${username}** needs to present their Heka contributor credential.\n\n` +
-      `Open the details page. The Heka wallet presents the credential, and this check updates when verification finishes.`,
+      `Open the details page. The Heka wallet presents the credential, and this check updates when verification finishes.` +
+      invalidPolicy,
   };
 }

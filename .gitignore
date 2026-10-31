@@ -5,6 +5,9 @@ node_modules/
 .env
 .env.local
 
+# GitHub App signing keys. Runtime keys come from PRIVATE_KEY.
+/*.pem
+
 # Build output
 dist/
 build/

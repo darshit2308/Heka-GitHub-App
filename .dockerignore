@@ -1,0 +1,6 @@
+.env
+.env.*
+*.pem
+.git
+node_modules
+lib
