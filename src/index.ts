@@ -7,6 +7,7 @@ import {
   handlePullRequestEvent,
   resumeAbandonedPullRequests,
 } from './handlers/pullRequestHandler.js';
+import { startAbandonedJobRecovery } from './handlers/webhook-recovery.js';
 import { installProductionWebhookJobStore } from './handlers/webhook-job-store.js';
 
 /**
@@ -44,9 +45,13 @@ export default (app: Probot): void => {
   assertRuntimeKeyIsOutsideTheRepo();
   if (process.env.NODE_ENV !== 'test') {
     installProductionWebhookJobStore();
-    void resumeAbandonedPullRequests(app).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      app.log.error(`Could not resume webhook jobs. ${message}`);
+    startAbandonedJobRecovery(async (now) => {
+      try {
+        await resumeAbandonedPullRequests(app, now);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        app.log.error(`Could not resume webhook jobs. ${message}`);
+      }
     });
   }
   app.log.info('Heka identity verification bot is live and listening.');

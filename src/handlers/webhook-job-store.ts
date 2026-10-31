@@ -219,8 +219,9 @@ function isPullRequestAction(action: string): action is NormalizedPullRequestEve
 
 /**
  * File journal plus the identity-service row. The file is what a restart reads.
- * The database deduplicates across processes. A remote failure leaves the local
- * lease in place so the next start can resume it.
+ * The database deduplicates across processes. The local row stays `processing`
+ * until the identity service accepts `completed` or `failed`, so a failed
+ * mirror is retried instead of hidden.
  */
 export class DurableWebhookJobStore implements WebhookJobStore {
   public constructor(private readonly local: FileWebhookJobStore) {}
@@ -258,12 +259,8 @@ export class DurableWebhookJobStore implements WebhookJobStore {
   }
 
   public async finish(deliveryId: string, status: 'completed' | 'failed'): Promise<void> {
+    await finishWebhookJob(deliveryId, status);
     await this.local.finish(deliveryId, status);
-    try {
-      await finishWebhookJob(deliveryId, status);
-    } catch {
-      // Local status is already terminal. A later mirror can no-op.
-    }
   }
 
   public forget(deliveryId: string): Promise<void> {
@@ -283,7 +280,12 @@ export class DurableWebhookJobStore implements WebhookJobStore {
           deliveryId: job.deliveryId,
         };
         const decision = await this.local.accept(event, now);
-        if (decision.disposition === 'skip') continue;
+        if (decision.disposition === 'skip') {
+          if (decision.status === 'completed' || decision.status === 'failed') {
+            await this.pushTerminal(job.deliveryId, decision.status, decision.checkRunId ?? job.checkRunId);
+          }
+          continue;
+        }
         if (job.checkRunId) await this.local.recordCheck(job.deliveryId, job.checkRunId);
         local.push({
           deliveryId: job.deliveryId,
@@ -301,6 +303,20 @@ export class DurableWebhookJobStore implements WebhookJobStore {
 
   public peek(deliveryId: string): Promise<WebhookJobRecord | undefined> {
     return this.local.peek(deliveryId);
+  }
+
+  /** Copies a local terminal row onto a remote row that is still processing. */
+  private async pushTerminal(
+    deliveryId: string,
+    status: 'completed' | 'failed',
+    checkRunId: string | undefined,
+  ): Promise<void> {
+    try {
+      if (checkRunId) await recordWebhookCheck(deliveryId, checkRunId);
+      await finishWebhookJob(deliveryId, status);
+    } catch {
+      // The remote lease stays in place. The next recovery tick tries again.
+    }
   }
 }
 

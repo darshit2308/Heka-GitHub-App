@@ -2,13 +2,17 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, describe, expect, test } from 'vitest';
+import nock from 'nock';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
+import { startAbandonedJobRecovery, WEBHOOK_RECOVERY_INTERVAL_MS } from '../src/handlers/webhook-recovery.js';
 import { settleWebhookJob } from '../src/handlers/webhook-job-runner.js';
 import {
+  DurableWebhookJobStore,
   FileWebhookJobStore,
   WEBHOOK_JOB_LEASE_MS,
   type NormalizedPullRequestEvent,
+  type WebhookJobRecord,
 } from '../src/handlers/webhook-job-store.js';
 
 const event: NormalizedPullRequestEvent = {
@@ -35,6 +39,10 @@ function journal(): { directory: string; file: string } {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
+  nock.cleanAll();
+  nock.enableNetConnect();
+  delete process.env.HEKA_STATUS_TOKEN;
   for (const directory of directories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -98,6 +106,99 @@ describe('webhook job journal', () => {
 
     expect(created).toBe(0);
     await expect(new FileWebhookJobStore(file).peek('delivery-crash')).resolves.toMatchObject({
+      status: 'completed',
+      checkRunId: '42',
+    });
+  });
+
+  test('a running worker retries a failed attach after the lease without creating another check', async () => {
+    vi.useFakeTimers();
+    const { file } = journal();
+    let now = 1_700_000_000_000;
+    const store = new FileWebhookJobStore(file);
+    await store.accept(event, now);
+    const first = await store.peek(event.deliveryId);
+    let created = 0;
+    let attaches = 0;
+
+    const settle = (job: WebhookJobRecord) =>
+      settleWebhookJob(job, store, {
+        ensureCheck: async (existing) => {
+          if (!existing) created += 1;
+          return existing ?? '42';
+        },
+        attach: async () => {
+          attaches += 1;
+          if (attaches === 1) throw new Error('attach failed');
+        },
+      });
+
+    await expect(settle(first!)).rejects.toThrow('attach failed');
+    expect(created).toBe(1);
+
+    const recovery = startAbandonedJobRecovery(
+      async (at) => {
+        const abandoned = await store.leaseAbandoned(at);
+        for (const job of abandoned) await settle(job);
+      },
+      { now: () => now, intervalMs: WEBHOOK_RECOVERY_INTERVAL_MS },
+    );
+    await recovery.tick();
+    expect(attaches).toBe(1);
+
+    now += WEBHOOK_JOB_LEASE_MS + 1;
+    await vi.advanceTimersByTimeAsync(WEBHOOK_RECOVERY_INTERVAL_MS);
+    await recovery.tick();
+    recovery.stop();
+
+    expect(created).toBe(1);
+    expect(attaches).toBe(2);
+    await expect(store.peek(event.deliveryId)).resolves.toMatchObject({
+      status: 'completed',
+      checkRunId: '42',
+    });
+  });
+
+  test('remote finish fails, App restarts, job resolves without a duplicate check', async () => {
+    process.env.HEKA_STATUS_TOKEN = 'test-status-token';
+    nock.disableNetConnect();
+    const { file } = journal();
+    const crashedAt = Date.now() - WEBHOOK_JOB_LEASE_MS - 1;
+    nock('http://localhost:3000')
+      .patch('/v2/presentation-session/deliveries/delivery-crash')
+      .reply(200)
+      .patch('/v2/presentation-session/deliveries/delivery-crash')
+      .reply(500)
+      .patch('/v2/presentation-session/deliveries/delivery-crash')
+      .reply(200);
+
+    const running = new DurableWebhookJobStore(new FileWebhookJobStore(file));
+    await running.accept(event, crashedAt);
+    await running.recordCheck(event.deliveryId, '42');
+    await expect(running.finish(event.deliveryId, 'completed')).rejects.toThrow();
+    await expect(new FileWebhookJobStore(file).peek(event.deliveryId)).resolves.toMatchObject({
+      status: 'processing',
+      checkRunId: '42',
+    });
+
+    const restarted = new DurableWebhookJobStore(new FileWebhookJobStore(file));
+    const abandoned = await restarted.leaseAbandoned(Date.now());
+    expect(abandoned.map((job) => job.deliveryId)).toEqual(['delivery-crash']);
+    expect(abandoned[0]?.checkRunId).toBe('42');
+
+    let created = 0;
+    await settleWebhookJob(abandoned[0]!, restarted, {
+      ensureCheck: async (existing) => {
+        if (!existing) created += 1;
+        return existing ?? '99';
+      },
+      attach: async (checkRunId) => {
+        expect(checkRunId).toBe('42');
+      },
+    });
+
+    expect(created).toBe(0);
+    await expect(new FileWebhookJobStore(file).peek(event.deliveryId)).resolves.toMatchObject({
       status: 'completed',
       checkRunId: '42',
     });

@@ -23,8 +23,9 @@ const CHECK_NAME = 'Heka Identity Verification';
  *
  * Flow:
  *   1. Lease the delivery. A live lease or a finished job is skipped. The job
- *      stays in progress until the check run exists and is attached, so a
- *      restart can resume it. GitHub will not redeliver an event it accepted.
+ *      stays in progress until the check run exists and is attached. A timer
+ *      in this process resumes an expired lease, so a failed attach is retried
+ *      without waiting for a restart. GitHub will not redeliver an event it accepted.
  *   2. Skip when this commit already has a Heka check run, and attach that
  *      check when this delivery still owes the session a link.
  *   3. Ask the identity service for an OID4VP session. The session page is
@@ -221,8 +222,8 @@ export async function handlePullRequestClosed(
 }
 
 /** Replays jobs whose worker stopped after GitHub had already accepted the webhook. */
-export async function resumeAbandonedPullRequests(app: Probot): Promise<void> {
-  const abandoned = await webhookJobs().leaseAbandoned(Date.now());
+export async function resumeAbandonedPullRequests(app: Probot, now = Date.now()): Promise<void> {
+  const abandoned = await webhookJobs().leaseAbandoned(now);
   for (const job of abandoned) {
     try {
       const context = await contextForAbandonedJob(app, job);
