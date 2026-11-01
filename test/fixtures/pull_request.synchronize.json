@@ -22,7 +22,8 @@
     "full_name": "test-org/test-repo",
     "owner": {
       "login": "test-org"
-    }
+    },
+    "default_branch": "main"
   },
   "installation": {
     "id": 2
